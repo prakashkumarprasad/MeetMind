@@ -1,0 +1,1 @@
+# MeetMind backend application package.

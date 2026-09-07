@@ -1,0 +1,30 @@
+# --- Web framework ---
+fastapi==0.*
+uvicorn[standard]==0.*
+pydantic-settings==2.*
+email-validator==2.*
+python-dotenv==1.*
+python-multipart==0.*
+
+# --- Auth ---
+bcrypt==4.*
+PyJWT==2.*
+
+# --- Database ---
+SQLAlchemy==2.*
+psycopg[binary]==3.*
+alembic==1.*
+pgvector==0.*
+
+# --- Redis / background jobs ---
+redis==5.*
+celery==5.*
+
+# --- Cloud storage ---
+boto3==1.*
+
+# --- AI / ML pipeline ---
+faster-whisper==1.*
+sentence-transformers==3.*
+groq==0.*
+httpx==0.*
