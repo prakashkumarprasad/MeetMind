@@ -1,6 +1,7 @@
 # Redis-backed rate limiting helper used by auth, chat, and upload routes.
 
 import time
+import uuid
 
 import redis
 
@@ -22,7 +23,7 @@ def is_rate_limited(key, max_attempts=5, window_seconds=900):
     if attempt_count >= max_attempts:
         return True
 
-    redis_client.zadd(redis_key, {str(now): now})
+    redis_client.zadd(redis_key, {str(uuid.uuid4()): now})
     redis_client.expire(redis_key, window_seconds)
     return False
 
@@ -66,6 +67,6 @@ def increment_rate_limit(key, max_attempts=5, window_seconds=900):
             return True, retry_after
         return True, window_seconds
 
-    redis_client.zadd(redis_key, {str(now): now})
+    redis_client.zadd(redis_key, {str(uuid.uuid4()): now})
     redis_client.expire(redis_key, window_seconds)
     return False, 0

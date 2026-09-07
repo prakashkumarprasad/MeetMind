@@ -28,3 +28,6 @@ faster-whisper==1.*
 sentence-transformers==3.*
 groq==0.*
 httpx==0.*
+
+# --- Testing ---
+pytest==8.*
