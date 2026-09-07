@@ -41,7 +41,7 @@ jobs:
           --health-retries 5
 
     env:
-      ENVIRONMENT: test
+      ENVIRONMENT: development
       DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5433/meetmind_test
       REDIS_URL: redis://localhost:6380
       JWT_SECRET_KEY: ci-test-secret-key-not-for-production
