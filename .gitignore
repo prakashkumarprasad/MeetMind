@@ -27,7 +27,6 @@ Thumbs.db
 *.log
 
 DEV_CONTEXT.md
-README.md
 frontend/AGENTS.md
 frontend/CLAUDE.md
 backend/test_presigned_post.py

@@ -9,6 +9,7 @@ python-multipart==0.*
 # --- Auth ---
 bcrypt==4.*
 PyJWT==2.*
+google-auth==2.*
 
 # --- Database ---
 SQLAlchemy==2.*
