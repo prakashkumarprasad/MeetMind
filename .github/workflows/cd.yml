@@ -1,0 +1,48 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -e
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/meetmind.pem
+          chmod 600 ~/.ssh/meetmind.pem
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/meetmind.pem \
+            "$EC2_USER@$EC2_HOST" \
+            "cd ~/MeetMind && \
+             git fetch origin main && \
+             git checkout main && \
+             git reset --hard $DEPLOY_SHA && \
+             cd backend && \
+             docker build -t meetmind-backend:latest . && \
+             docker compose up -d --no-build && \
+             docker image prune -f"
+
+          rm -f ~/.ssh/meetmind.pem
