@@ -27,7 +27,7 @@ from app.models.meeting import Meeting
 from app.services.s3 import s3_client
 from app.core.config import settings
 
-_model = WhisperModel("medium", device="cuda", compute_type="float16")
+_model = WhisperModel("medium", device="cpu", compute_type="int8",cpu_threads=2)
 
 EXTENSION_BY_MIME = {
     "audio/mpeg": ".mp3",

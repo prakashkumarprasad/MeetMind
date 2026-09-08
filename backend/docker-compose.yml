@@ -1,16 +1,35 @@
+
 # backend/docker-compose.yml
+
 services:
+
   backend:
+
     build: .
+
+    image: meetmind-backend:latest
+
     ports:
+
       - "127.0.0.1:8000:8000"
+
     env_file:
+
       - .env
+
     restart: unless-stopped
 
   worker:
+
     build: .
-    command: celery -A app.workers.celery_app worker --loglevel=info
+
+    image: meetmind-backend:latest
+
+    command: celery -A app.workers.celery_app worker --loglevel=info --pool=solo
+
     env_file:
+
       - .env
+
     restart: unless-stopped
+
