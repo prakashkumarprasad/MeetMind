@@ -43,7 +43,7 @@ jobs:
              git reset --hard $DEPLOY_SHA && \
              cd backend && \
              docker build -t meetmind-backend:latest . && \
-             docker compose up -d --no-build && \
+             docker compose up -d --no-build --force-recreate && \
              docker image prune -f"
 
           rm -f ~/.ssh/meetmind.pem
