@@ -6,6 +6,11 @@ RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 COPY requirements.txt .
+
+# Install CPU-only torch first so pip doesn't pull the CUDA-enabled build
+# (this instance has no GPU, and the CUDA packages alone are 2GB+)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
