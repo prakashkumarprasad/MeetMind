@@ -27,6 +27,7 @@ locally, and how to test it.
 - [RAG / Chat Design](#rag--chat-design)
 - [Security Design](#security-design)
 - [Getting Started](#getting-started)
+- [Production Deployment](#production-deployment)
 - [Environment Variables Reference](#environment-variables-reference)
 - [Database Migrations](#database-migrations)
 - [Testing](#testing)
@@ -37,27 +38,10 @@ locally, and how to test it.
 
 ## 🔗 Repository
 
-<!--
-
-  No git remote is currently configured on this machine, so there is no
-  canonical URL to link to yet. Replace the placeholder below with the real
-  repository URL (GitHub / GitLab / etc.) once it exists.
-
-  e.g.  git remote add origin https://github.com/<your-org>/MeetMind.git
-
--->
-
-**Repository:** `https://github.com/<your-org>/MeetMind` _(placeholder — add the
-real URL here)_
-
-To add a remote once it's available:
-
-```bash
-git remote add origin https://github.com/<your-org>/MeetMind.git
-```
+**Repository:** `https://github.com/prakashkumarprasad/MeetMind`
 
 The repository is a single monorepo containing two top-level packages:
-`backend/` (FastAPI + Celery + Postgres/pgvector) and `frontend/`
+`backend/` (FastAPI + Celery + PostgreSQL/pgvector) and `frontend/`
 (Next.js App Router + React 19 + TypeScript).
 
 ---
@@ -74,8 +58,8 @@ MeetMind's flow is:
    files never touch the API server.
 2. **Process (asynchronous)** — a Celery worker downloads the file, converts
    video to audio with `ffmpeg` when needed, transcribes it with `faster-whisper`
-   (CUDA, GPU-accelerated), chunks and embeds the transcript into **pgvector**,
-   and generates a summary + action items with an LLM.
+   (`medium`, CPU/INT8 in production), chunks and embeds the transcript into
+   **pgvector**, and generates a summary + action items with an LLM.
 3. **Chat (RAG)** — the user asks natural-language questions. The backend
    retrieves relevant context from the embedded transcript chunks (and stored
    meeting summaries) and the LLM answers with **cited sources** — which meeting
@@ -88,9 +72,10 @@ chunks, and chat data are scoped to workspaces with membership checks.
 
 ## Features
 
-- **AI transcription** — upload audio or video; `faster-whisper` (medium, CUDA,
-  float16) transcribes speech-to-text. Video files are automatically converted
-  to 16 kHz mono WAV audio with `ffmpeg` first.
+- **AI transcription** — upload audio or video; `faster-whisper` (medium) transcribes
+  speech-to-text. The current production worker runs the medium model on CPU with
+  INT8 and two CPU threads. Video files are automatically converted to 16 kHz mono
+  WAV audio with `ffmpeg` first.
 - **Meeting summaries & action items** — each ready meeting has a generated
   prose summary plus actionable items with owner and due date.
 - **Chat with your meetings** — an interactive, multi-turn chat UI. Users select
@@ -128,7 +113,7 @@ chunks, and chat data are scoped to workspaces with membership checks.
 | Cache / broker | Redis (Upstash in prod) |
 | Background jobs | Celery 5.x |
 | Object storage | AWS S3 or any S3-compatible store (Supabase Storage, MinIO) via `boto3` |
-| Transcription | `faster-whisper` (CUDA) + `ffmpeg` for video → audio |
+| Transcription | `faster-whisper` (CPU/INT8 in production) + `ffmpeg` for video → audio |
 | Embeddings | `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim) |
 | LLM | Groq (default) or Ollama (local) via the `groq` / `httpx` SDKs |
 | Auth | `bcrypt` (password hashing) + `PyJWT` (JWT + refresh-token families) |
@@ -172,7 +157,7 @@ chunks, and chat data are scoped to workspaces with membership checks.
                                         ▲
                                         │ publish / consume
                         ┌───────────────┴──────────────────────────┐
-                        │              Celery Worker (GPU)          │
+                        │              Celery Worker              │
                         │  1. transcribe_meeting (faster-whisper,  │
                         │     ffmpeg for video)                     │
                         │  2. embed_meeting (chunk + pgvector)      │
@@ -194,8 +179,8 @@ Key architectural decisions:
   The server always generates the storage key itself (never trusts client
   filenames) to prevent path/filename injection.
 - **Web/worker split.** Celery decouples the heavy ingestion pipeline (whisper,
-  embeddings, LLM) from the API so requests stay fast. The worker runs on a
-  machine with a CUDA GPU.
+  embeddings, LLM) from the API so requests stay responsive. In production, the
+  FastAPI backend and Celery worker run as separate containers on AWS EC2.
 - **pgvector for retrieval.** Transcripts are chunked (~200 words with 30-word
   overlap) and embedded into a `Vector(384)` column for semantic similarity
   search (with a bounded-distance threshold and recency bonus).
@@ -395,8 +380,9 @@ Celery task `transcribe_meeting`, which chains into the full pipeline:
    - Sets status to `transcribing`, downloads the file from S3.
    - If the source is video (`source_media_type == "video"`), status → `converting`
      and `ffmpeg` extracts the audio track to 16 kHz mono WAV.
-   - `faster-whisper` (`medium`, CUDA, float16) transcribes with the `translate`
-     task (translates to English). Status → `validating`.
+   - `faster-whisper` (`medium`) transcribes with the `translate` task (translates
+     to English). Production uses CPU inference with INT8 and two CPU threads.
+     Status → `validating`.
    - Enqueues `embed_meeting`.
    - On failure: status → `failed` with a friendly `error_message`.
 
@@ -415,11 +401,11 @@ Celery task `transcribe_meeting`, which chains into the full pipeline:
    - On failure: status → `failed`.
 
 These same statuses are surfaced to users through a single shared frontend
-component, `MeetingProcessingPanel`, which is used identically on meeting cards
-and the meeting detail page. It renders a loading bar with the current stage
-percentage and a step tracker (checkmarks on completed steps). For video
-meetings it also shows an amber notice that the recording is first converted to
-audio, which is why video uploads take a little longer.
+component, `MeetingProcessingPanel`, which is used on meeting cards and the meeting
+detail page. It renders a loading bar, a step tracker with checkmarks on completed
+steps, and a reassurance message explaining that processing can take a few minutes.
+For video meetings it also shows an amber notice that the recording is first converted
+to audio, which is why video uploads take a little longer.
 
 The dashboard polls the meeting list every 5 s while anything is still in an
 in-progress status, so users see live progress.
@@ -509,7 +495,7 @@ MeetMind was built with several deliberate security hardening choices:
 - Python 3.12
 - Node.js 20+ (Next.js 16)
 - Docker (for local Postgres/pgvector + Redis)
-- Optional but recommended: an NVIDIA CUDA GPU for `faster-whisper`
+- Optional: an NVIDIA GPU can accelerate `faster-whisper`; production currently uses the medium model on CPU/INT8.
 - An LLM provider API key (Groq by default; Ollama also supported)
 
 ### 1. Backend
@@ -572,8 +558,47 @@ npm run dev
 
 ```bash
 cd backend
-docker compose up --build        # starts the API (port 8000) + Celery worker
+docker compose up --build        # starts the API + Celery worker
 ```
+
+The production Docker image is CPU-oriented: the backend Dockerfile installs the
+CPU-only PyTorch wheel because the current EC2 worker does not have a GPU. The worker
+uses Celery's `solo` pool to keep memory usage predictable on the small EC2 instance.
+
+---
+
+## Production Deployment
+
+The current production architecture is:
+
+```
+Vercel
+└── Next.js frontend
+
+AWS EC2
+├── Nginx / HTTPS
+├── FastAPI backend container
+└── Celery worker container
+    └── faster-whisper medium (CPU, INT8, 2 CPU threads)
+
+Upstash Redis
+└── Celery broker/result backend + rate limiting
+
+S3-compatible storage
+└── Meeting recordings uploaded with presigned requests
+```
+
+The frontend is deployed through Vercel. The FastAPI backend and Celery worker run
+in Docker containers on EC2. The EC2 instance uses an Elastic IP as the stable
+deployment target and Nginx terminates HTTPS for the backend.
+
+GitHub Actions runs continuous integration for `main` and `develop`. For `main`,
+a successful CI run triggers the CD workflow, which connects to EC2 over SSH, checks
+out the exact commit tested by CI, builds the backend image, and recreates both the
+API and Celery worker containers.
+
+The deployment workflow uses repository secrets named `EC2_HOST`, `EC2_USER`, and
+`EC2_SSH_PRIVATE_KEY_B64`.
 
 ---
 
@@ -655,22 +680,22 @@ A quick sanity compile:
 python -m compileall app
 ```
 
-### Frontend (TypeScript + ESLint)
+### Frontend (TypeScript + ESLint + production build)
 
 ```bash
 cd frontend
 npx tsc --noEmit        # type check
 npm run lint            # eslint
+npm run build           # production build
 ```
 
 ---
 
 ## Comments & Code Style Policy
 
-To keep the codebase clean and docs-in-code minimal, **all source files carry a
-single header comment** describing the file's purpose, and no other comments
-(e.g. `# ...` in Python, `//` / `/* ... */` in TypeScript/JSX) are kept. The
-exceptions that are intentionally preserved:
+To keep the codebase clean and docs-in-code minimal, source files generally use
+short purpose comments where they improve maintainability. Tooling directives and
+Python docstrings are retained when required:
 
 - **Directive comments** required for tooling to work correctly:
   `# noqa: ...` (Python lint suppressions), `eslint-disable` / `eslint-enable`,
@@ -698,12 +723,11 @@ Example — frontend (client component, directive stays first):
 
 ## Status & Roadmap
 
-**Current status:** the application is feature-complete on its happy path —
-authentication, uploads, the full transcription/embedding/summarization pipeline,
-multi-meeting RAG chat with sources, and the dashboard UI are all implemented.
-The backend pytest suite and frontend type/lint checks pass; the remaining
-validation is runtime/end-to-end against a live environment (real LLM key, a
-running Celery worker, and a running FastAPI instance).
+**Current status:** the application is deployed and operational on its main happy
+path: authentication, audio/video uploads, asynchronous transcription, embeddings,
+AI summaries/action items, multi-meeting RAG chat with sources, and the dashboard UI.
+Backend pytest checks and frontend type/lint/build checks are part of CI. Production
+deployment is handled by GitHub Actions → EC2, with Vercel serving the frontend.
 
 Ideas for future work (not yet implemented):
 - Workspace management UI (create/invite members, role management).
@@ -711,8 +735,7 @@ Ideas for future work (not yet implemented):
 - Editing/regenerating meeting summaries.
 - Per-meeting chat scoping + persistent conversation threads in the UI.
 - More LLM providers and configurable chunking/retrieval tuning.
-- Production deployment manifests (a real `docker-compose.yml` with Postgres +
-  Redis services and CI/CD).
+- Workspace administration and collaboration features.
 
 ---
 
