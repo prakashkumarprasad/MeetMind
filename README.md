@@ -739,8 +739,5 @@ Ideas for future work (not yet implemented):
 
 ---
 
-*Documentation generated from the MeetMind codebase. See the file-header comments
-in each source file for a one-line description of that file's purpose.*
-
 
 
