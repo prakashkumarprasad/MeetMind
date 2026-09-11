@@ -16,7 +16,7 @@ note on the LLM call).
 import pytest
 import numpy as np
 
-from app.api.v1.chat import CHAT_RATE_LIMIT_MAX
+from app.api.v1.chat import CHAT_RATE_LIMIT_MAX, _find_title_matched_meetings
 
 @pytest.fixture(autouse=True)
 def _mock_embeddings(monkeypatch):
@@ -386,6 +386,354 @@ def _make_meeting(db_session, user, workspace, title, *, status="ready", summary
         db_session.flush()
 
     return meeting
+# ---------------------------------------------------------------------------
+# Title token-overlap matching (CASE 1)
+# ---------------------------------------------------------------------------
+
+def test_title_token_overlap_finds_partial_title_match(client, make_user, db_session):
+    """
+    A question that never contains the full meeting title still matches via
+    token overlap: 'soft computing' in the question vs a title of
+    'Soft Computing Weekly'. Pre-fix, the word-boundary regex only matched
+    the exact full title, so these questions silently fell through to the
+    semantic fallback.
+    """
+    user, workspace, headers = make_user("titleoverlap@example.com")
+    meeting = _make_meeting(
+        db_session, user, workspace, "Soft Computing Weekly",
+        summary="SOFT-COMPUTING-SUMMARY-TOKEN: covered tensor graphs",
+    )
+
+    matched = _find_title_matched_meetings(
+        db_session, workspace.id, "what did the soft computing meeting cover"
+    )
+
+    assert [m.id for m in matched] == [meeting.id]
+
+
+def test_title_token_overlap_rejects_short_or_stopword_tokens(client, make_user, db_session):
+    """
+    Short (<5 char) tokens like 'new' and '5', and stopwords, must NOT match.
+    'new' must not match 'new5' or 'neweeww' (the original false positives the
+    word-boundary regex was introduced to prevent); the overlap variant keeps
+    that protection via the minimum-length + stopword guards.
+    """
+    user, workspace, headers = make_user("titleneg@example.com")
+    m_new5 = _make_meeting(db_session, user, workspace, "new5")
+    m_neweeww = _make_meeting(db_session, user, workspace, "neweeww")
+
+    matched = _find_title_matched_meetings(
+        db_session, workspace.id, "what is in the new meeting"
+    )
+
+    matched_ids = {m.id for m in matched}
+    assert m_new5.id not in matched_ids
+    assert m_neweeww.id not in matched_ids
+
+
+def test_title_token_overlap_is_workspace_scoped(client, make_user, db_session):
+    """
+    A title token present in another workspace's meeting must not surface it
+    into this workspace's in-scope set.
+    """
+    _, workspace_a, headers_a = make_user("titleiso_a@example.com")
+    user_b, workspace_b, _ = make_user("titleiso_b@example.com")
+
+    foreign = _make_meeting(
+        db_session, user_b, workspace_b, "Zebracorn Beta",
+        summary="FOREIGN-WORKSPACE-SUMMARY-TOKEN",
+    )
+
+    matched = _find_title_matched_meetings(
+        db_session, workspace_a.id, "tell me about zebracorn beta"
+    )
+
+    assert foreign.id not in [m.id for m in matched]
+# ---------------------------------------------------------------------------
+# Dedicated metadata-intent path (CASE 2)
+# ---------------------------------------------------------------------------
+
+def test_metadata_upload_date_question_answered_deterministically(client, make_user, db_session):
+    """
+    'When was the meeting uploaded?' must be answered from DB metadata with a
+    deterministic %Y-%m-%d date string and a source, NOT via semantic search
+    (which has no way to link text to an upload timestamp).
+    """
+    user, workspace, headers = make_user("metaupload@example.com")
+    meeting = _make_meeting(
+        db_session, user, workspace, "Upload Date Meeting",
+        summary="UPLOAD-SUMMARY-TOKEN: some content",
+        chunk="some transcript text for the upload meeting",
+    )
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "When was the meeting uploaded?"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    expected_date = meeting.created_at.strftime("%Y-%m-%d")
+    assert meeting.title in body["answer"]
+    assert expected_date in body["answer"]
+    assert body["sources"] is not None
+    assert body["sources"][0]["meeting_id"] == str(meeting.id)
+
+
+def test_metadata_title_question_answered_deterministically(client, make_user, db_session):
+    user, workspace, headers = make_user("metatitle@example.com")
+    meeting = _make_meeting(
+        db_session, user, workspace, "Title Answer Meeting",
+        summary="TITLE-SUMMARY-TOKEN",
+    )
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "What is the title of the meeting?"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert meeting.title in body["answer"]
+    assert "you're referring to" in body["answer"]
+
+
+def test_metadata_list_meetings_question(client, make_user, db_session):
+    user, workspace, headers = make_user("metalist@example.com")
+    _make_meeting(db_session, user, workspace, "Alpha Meeting", summary="ALPHA-SUMMARY")
+    _make_meeting(db_session, user, workspace, "Beta Meeting", summary="BETA-SUMMARY")
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "List all meetings"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    answer = resp.json()["answer"]
+    assert "Alpha Meeting" in answer
+    assert "Beta Meeting" in answer
+    assert "Here are your meetings" in answer
+
+
+def test_metadata_count_meetings_question(client, make_user, db_session):
+    user, workspace, headers = make_user("metacount@example.com")
+    _make_meeting(db_session, user, workspace, "Only One Meeting", summary="ONLY-SUMMARY")
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "How many meetings do I have?"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    answer = resp.json()["answer"]
+    assert "1 meeting" in answer
+
+
+def test_content_question_not_intercepted_by_metadata_detector(client, make_user, db_session, monkeypatch):
+    """
+    Ordinary content questions such as 'What was discussed...?' must NOT be
+    classed as metadata and short-circuited — they keep flowing through the
+    RAG pipeline with real meeting context.
+    """
+    user, workspace, headers = make_user("metacontent@example.com")
+    _make_meeting(
+        db_session, user, workspace, "Content Meeting",
+        summary="CONTENT-SUMMARY-TOKEN: discuss roadmap and budget",
+        chunk="we discussed the roadmap and the budget numbers",
+    )
+
+    holder = _capture_rag_messages(monkeypatch)
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "What was discussed in the content meeting?"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    prompt = "\n".join(m["content"] for m in holder["messages"])
+    assert "CONTENT-SUMMARY-TOKEN" in prompt
+def test_metadata_reference_resolution_from_history_sources(client, make_user, db_session):
+    """
+    Follow-up 'When was the meeting uploaded?' WITHOUT meeting_ids resolves
+    the referent from the previous assistant turn's source list.
+    """
+    user, workspace, headers = make_user("metaref@example.com")
+    _make_meeting(
+        db_session, user, workspace, "Referenced Meeting",
+        summary="REF-SUMMARY-TOKEN: covered the quarterly plan",
+        chunk="quarterly plan details",
+    )
+
+    first = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "What did the Referenced Meeting cover?"},
+        headers=headers,
+    )
+    session_id = first.json()["session_id"]
+
+    second = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "When was that meeting uploaded?", "session_id": session_id},
+        headers=headers,
+    )
+
+    assert second.status_code == 200
+    answer = second.json()["answer"]
+    assert "Referenced Meeting" in answer
+
+
+def test_metadata_reference_no_history_falls_back_to_most_recent(client, make_user, db_session):
+    """
+    With no history and no meeting_ids, an upload-date question references the
+    most recently created 'ready' meeting in the workspace.
+    """
+    from datetime import datetime, timezone
+
+    user, workspace, headers = make_user("metafallback@example.com")
+    older = _make_meeting(db_session, user, workspace, "Older Meeting", summary="OLDER-SUMMARY")
+    newer = _make_meeting(db_session, user, workspace, "Newest Meeting", summary="NEWER-SUMMARY")
+
+    older.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    newer.created_at = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    db_session.flush()
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "When was the meeting uploaded?"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    answer = resp.json()["answer"]
+    assert "Newest Meeting" in answer
+    assert "2026-02-01" in answer
+
+
+def test_metadata_answers_are_workspace_scoped(client, make_user, db_session):
+    """
+    A meeting in workspace B must never appear (or be referenced) by a
+    metadata query issued inside workspace A.
+    """
+    _, workspace_a, headers_a = make_user("metaiso_a@example.com")
+    user_b, workspace_b, _ = make_user("metaiso_b@example.com")
+
+    _make_meeting(
+        db_session, user_b, workspace_b, "Top Secret B Meeting",
+        summary="B-WORKSPACE-SECRET-SUMMARY",
+    )
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_a.id}/chat",
+        json={"question": "List all meetings"},
+        headers=headers_a,
+    )
+
+    assert resp.status_code == 200
+    answer = resp.json()["answer"]
+    assert "Top Secret B Meeting" not in answer
+    assert "don't have any completed meetings" in answer
+
+
+# ---------------------------------------------------------------------------
+# Global search includes summaries (CASE 1 part) + workspace scoping
+# ---------------------------------------------------------------------------
+
+def test_global_search_finds_summary_only_meeting_and_is_workspace_scoped(client, make_user, db_session, monkeypatch):
+    """
+    A meeting with a summary but NO transcript chunks must be discoverable via
+    the global semantic search, and its metadata block must be populated so
+    the model has title/date to draw on. A summary in another workspace must
+    not leak in.
+
+    Global-search distances here rely on the mocked embeddings: we return a
+    constant non-zero vector so both the question and the summary land at
+    cosine distance 0.
+    """
+    user_a, workspace_a, headers_a = make_user("sumglobal@example.com")
+    user_b, workspace_b, _ = make_user("sumglobal_b@example.com")
+
+    meeting_a = _make_meeting(
+        db_session, user_a, workspace_a, "Summary Only Monthly",
+        summary="GLOBAL-SUMMARY-UNIQUE-TOKEN about the quarterly roadmap",
+    )
+    _make_meeting(
+        db_session, user_b, workspace_b, "Other Summary",
+        summary="B-SUMMARY-LEAK-TOKEN about unrelated work",
+    )
+
+    def _encode_all_ones(text):
+        if isinstance(text, list):
+            return [np.ones(384) for _ in text]
+        return np.ones(384)
+
+    monkeypatch.setattr(
+        "app.api.v1.chat._embedding_model.encode",
+        _encode_all_ones,
+    )
+
+    holder = _capture_rag_messages(monkeypatch)
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace_a.id}/chat",
+        json={"question": "tell me about trigonometry in depth"},
+        headers=headers_a,
+    )
+
+    assert resp.status_code == 200
+    prompt = "\n".join(m["content"] for m in holder["messages"])
+    assert "GLOBAL-SUMMARY-UNIQUE-TOKEN" in prompt, "summary-only meeting missing from global search results"
+    assert meeting_a.title in prompt, "meeting metadata (title) not populated for global-hit meeting"
+    assert "B-SUMMARY-LEAK-TOKEN" not in prompt, "foreign workspace summary leaked into prompt"
+    assert "<selected_meetings>" in prompt, "meeting metadata block not rendered for global-hit meeting"
+def test_irrelevant_summary_filtered_despite_bonus(client, make_user, db_session, monkeypatch):
+    """
+    The −0.05 ranking bonus must NOT let an irrelevant summary sneak past
+    the MAX_RELEVANT_DISTANCE filter.  The bonus only determines rank among
+    summaries that already pass the distance gate.
+
+    Setup: one meeting with a summary (no transcript chunks).  The question
+    embedding and the summary embedding are set to orthogonal vectors, giving
+    a cosine distance of 1.0 — well above the 0.8 threshold.  The summary
+    text must NOT appear in the assembled prompt.
+    """
+    user, workspace, headers = make_user("irrelsum@example.com")
+    _make_meeting(
+        db_session, user, workspace, "Irrelevant Topic",
+        summary="IRRELEVANT-SUMMARY about deep-sea fishing techniques",
+    )
+
+    # Orthogonal unit-ish vectors → cosine distance 1.0 > MAX_RELEVANT_DISTANCE.
+    def _encode(text):
+        if isinstance(text, list):
+            # batch path (summary encoding) — orthogonal to question vector
+            summary_vec = np.array([0.0] + [1.0] * 383, dtype=float)
+            return [summary_vec for _ in text]
+        if text == "What were the Q3 numbers?":
+            return np.array([1.0] + [0.0] * 383, dtype=float)
+        # single-string fallback (shouldn't be reached in this test)
+        return np.array([0.0] + [1.0] * 383, dtype=float)
+
+    monkeypatch.setattr("app.api.v1.chat._embedding_model.encode", _encode)
+    holder = _capture_rag_messages(monkeypatch)
+
+    resp = client.post(
+        f"/api/v1/workspaces/{workspace.id}/chat",
+        json={"question": "What were the Q3 numbers?"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    prompt = "\n".join(m["content"] for m in holder["messages"])
+    assert "IRRELEVANT-SUMMARY" not in prompt, (
+        "Summary with cosine distance > MAX_RELEVANT_DISTANCE was not filtered — "
+        "the −0.05 bonus should only affect ranking, not the distance gate"
+    )
+
 
 def test_aggregate_summary_uses_all_selected_meetings(client, make_user, db_session, monkeypatch):
     """

@@ -5,20 +5,6 @@ import subprocess
 import sys
 import tempfile
 
-if sys.platform == "win32":
-    import nvidia.cublas
-    import nvidia.cudnn
-    import nvidia.cuda_runtime
-    import nvidia.nvjitlink
-
-    _dll_dirs = [
-        os.path.join(nvidia.cublas.__path__[0], "bin"),
-        os.path.join(nvidia.cudnn.__path__[0], "bin"),
-        os.path.join(nvidia.cuda_runtime.__path__[0], "bin"),
-        os.path.join(nvidia.nvjitlink.__path__[0], "bin"),
-    ]
-    os.environ["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + os.environ["PATH"]
-
 from faster_whisper import WhisperModel
 
 from app.workers.celery_app import celery_app
